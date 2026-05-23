@@ -120,14 +120,29 @@ python app.py --port 8080 --no-browser
 └── 📂 _pic_selecter/          # 缓存与日志目录
     ├── 📂 thumbs/             # 缩略图缓存 (重复加载近乎瞬时)
     ├── 📄 log.txt             # 详细处理日志
-    └── 📄 skipped.log         # 坏图/无法读取文件清单
+    ├── 📄 skipped.log         # 坏图/无法读取文件清单
+    ├── 📄 winners.txt         # 成片清单（每行一个移动后的实际路径）
+    ├── 📄 losers.txt          # 废片清单（每行一个移动后的实际路径）
+    ├── 📄 winners.csv         # 成片清单（filename, final_path, original_path, result, group_id, reason）
+    └── 📄 losers.csv          # 废片清单（同上列；sidecar 作为附加行，reason 标注随哪张主图）
 ```
 
 ### 归档模式
 
 你可以在首页的“更多选项”中选择以下归档模式：
-- **移动模式（默认，推荐）**：将原片直接移动到 `winners/` 或 `losers/` 目录。最省磁盘空间，符合一次性选片直觉。反悔时文件会无损搬回原位。
-- **复制模式**：原片保持不动，在 `winners/` 和 `losers/` 中创建副本。需要双倍磁盘空间。
+- **移动模式（默认，推荐）**：将原片**移动**到 `winners/` 或 `losers/`，**不复制、不删除**，因此**不额外占用磁盘空间**，适合大量照片。反悔时文件会无损搬回原位。⚠️ 移动会改变原片位置，重要原片请先自行备份。
+- **复制模式**：原片保持不动，在 `winners/` 和 `losers/` 中创建**副本**，磁盘占用**接近翻倍**。
+
+> 同名 RAW（`.CR2/.CR3/.ARW/.NEF/.RAF/.DNG/.ORF/.RW2/.PEF/.SRW/.X3F` 等）与 `.XMP` sidecar 会自动跟随对应照片一起进入 `winners/` 或 `losers/`，并记录在 csv 清单里。
+
+### 结果清单与人工核对
+
+每次整理完成后，会自动在 `_pic_selecter/` 下生成 `winners.txt`、`losers.txt`、`winners.csv`、`losers.csv`，方便你逐一核对哪些照片被保留、哪些被淘汰、为什么被淘汰。
+
+**安全说明**：本工具**不会自动删除任何照片**。废片只是被移动到 `losers/` 文件夹。建议流程：
+1. 整理完成后，打开 `losers/` 文件夹（或对照 `losers.txt` / `losers.csv`）人工检查。
+2. 确认其中没有想保留的照片后，**由你自己手动删除** `losers/` 文件夹来释放空间。
+3. 若发现误删，移动模式下可在程序内反悔，文件会无损搬回原位。
 
 ---
 

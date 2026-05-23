@@ -1273,6 +1273,103 @@ def apply_group(group: GroupState, folder: str, dry_run: bool, mode: str,
     return moved
 
 
+# ---------------- 结果清单（winners/losers 的 txt + csv） ----------------
+
+def _original_of(group: GroupState, final_path: str) -> str:
+    """从 move_log 反查某个 final 路径对应的原始路径；查不到（dry-run/未搬）返回自身。"""
+    for e in group.move_log:
+        if e.get("dst") == final_path:
+            return e.get("src", final_path)
+    return final_path
+
+
+def _sidecars_of(group: GroupState, main_final: str, kind: str) -> list[tuple[str, str]]:
+    """该主文件对应的 sidecar 搬运对 [(src, dst)]。companion 与主文件共享最终 stem。"""
+    stem = Path(main_final).stem
+    out = []
+    for e in group.move_log:
+        if e.get("kind") == f"{kind}_companion" and Path(e.get("dst", "")).stem == stem:
+            out.append((e.get("src", ""), e.get("dst", "")))
+    return out
+
+
+def write_result_manifests(session: Optional[SessionState]) -> dict:
+    """把当前 winners/losers 结果写成 4 个清单文件到 _pic_selecter/。
+
+    幂等：每次整理完成（或查看结果）时重写，反映最新状态。
+    - winners.txt / losers.txt：每行一个主文件移动后的实际路径
+    - winners.csv / losers.csv：filename, final_path, original_path, result,
+      group_id, reason；sidecar 作为附加行（reason 标注随哪张主图）
+    返回 {"dir","winners","losers"} 计数，失败抛异常由调用方决定是否吞掉。
+    """
+    if session is None or not session.groups:
+        return {}
+    import csv as _csv
+
+    out_dir = pic_dir(session.folder)
+    out_dir.mkdir(exist_ok=True)
+
+    win_rows: list[dict] = []   # 主文件行
+    lose_rows: list[dict] = []
+    win_side_rows: list[dict] = []  # sidecar 行
+    lose_side_rows: list[dict] = []
+
+    for g in session.groups:
+        winners = ([g.winner] if g.winner else []) + list(g.extra_winners)
+        for w in winners:
+            orig = _original_of(g, w)
+            win_rows.append({
+                "filename": Path(w).name, "final_path": w,
+                "original_path": orig, "result": "winner",
+                "group_id": g.id, "reason": "",
+            })
+            for s_src, s_dst in _sidecars_of(g, w, "winner"):
+                win_side_rows.append({
+                    "filename": Path(s_dst).name, "final_path": s_dst,
+                    "original_path": s_src, "result": "winner",
+                    "group_id": g.id, "reason": f"sidecar (随 {Path(w).name})",
+                })
+        for lo in g.losers:
+            orig = _original_of(g, lo)
+            reason = g.auto_reject_reasons.get(orig, "")
+            lose_rows.append({
+                "filename": Path(lo).name, "final_path": lo,
+                "original_path": orig, "result": "loser",
+                "group_id": g.id, "reason": reason,
+            })
+            for s_src, s_dst in _sidecars_of(g, lo, "loser"):
+                lose_side_rows.append({
+                    "filename": Path(s_dst).name, "final_path": s_dst,
+                    "original_path": s_src, "result": "loser",
+                    "group_id": g.id, "reason": f"sidecar (随 {Path(lo).name})",
+                })
+
+    cols = ["filename", "final_path", "original_path", "result", "group_id", "reason"]
+
+    def _write_txt(path: Path, rows: list[dict]) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(r["final_path"] + "\n")
+
+    def _write_csv(path: Path, rows: list[dict]) -> None:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
+
+    _write_txt(out_dir / "winners.txt", win_rows)
+    _write_txt(out_dir / "losers.txt", lose_rows)
+    _write_csv(out_dir / "winners.csv", win_rows + win_side_rows)
+    _write_csv(out_dir / "losers.csv", lose_rows + lose_side_rows)
+
+    return {
+        "dir": str(out_dir),
+        "winners": len(win_rows), "losers": len(lose_rows),
+        "winner_sidecars": len(win_side_rows), "loser_sidecars": len(lose_side_rows),
+    }
+
+
 def _unique_target(folder: Path, name: str) -> Path:
     target = folder / name
     if not target.exists():
@@ -2546,6 +2643,12 @@ def _finalize_group_locked() -> None:
         SESSION.undo_stack = [u for u in SESSION.undo_stack
                               if u["group_index"] != finished_idx]
     save_state(SESSION)
+    # 全部组处理完 → 自动生成结果清单（失败不影响选片流程）
+    if all(gg.finished for gg in SESSION.groups):
+        try:
+            write_result_manifests(SESSION)
+        except Exception as e:
+            logger.warning(f"写结果清单失败: {e}")
 
 
 def _record_preference(left_path: Optional[str], right_path: Optional[str],
@@ -2853,6 +2956,11 @@ def api_winners():
                 "group_size": len(g.images),
                 "applied": g.applied,
             })
+    # 查看结果时刷新清单，保证 winners/losers.txt+csv 反映最新状态
+    try:
+        write_result_manifests(SESSION)
+    except Exception as e:
+        logger.warning(f"写结果清单失败: {e}")
     return jsonify({"winners": out})
 
 
@@ -3094,6 +3202,9 @@ def _run_grouping_async(accepted_infos, old_session_snapshot):
             new_session.prescreen_reject_reasons = dict(snap["prescreen_reject_reasons"])
             new_session.prescreen_restored = list(snap["prescreen_restored"])
             new_session.meta.update(snap["meta"])
+            # 补全被初筛剔除照片的 sidecar 映射（build_session_from_groups
+            # 只覆盖 accepted），让废片的 RAW/XMP 也能随之搬运
+            new_session.companions.update(snap.get("all_companions", {}))
 
             restored = set(snap["prescreen_restored"])
             for path in snap["prescreen_rejected"]:
@@ -3180,6 +3291,13 @@ def api_confirm_prescreen():
             "prescreen_reject_reasons": dict(SESSION.prescreen_reject_reasons),
             "prescreen_restored": list(SESSION.prescreen_restored),
             "meta": dict(SESSION.meta),
+            # 全部照片（含被初筛剔除的）的 sidecar 映射，保证废片的
+            # RAW/XMP 伴随文件也能随它一起搬进 losers/
+            "all_companions": {
+                info.path: list(getattr(info, "companions", None) or [])
+                for info in infos
+                if getattr(info, "companions", None)
+            },
         }
 
     t = threading.Thread(

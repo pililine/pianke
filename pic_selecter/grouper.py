@@ -44,6 +44,9 @@ RAW_EXTS = {
     ".x3f",                        # Sigma
 }
 
+# 伴随的元数据 sidecar：本身不是图片、不参与分析，但搬运时跟随同 stem 的主图。
+SIDECAR_EXTS = {".xmp"}
+
 ALL_INPUT_EXTS = IMAGE_EXTS | RAW_EXTS
 
 # 分析尺寸：所有 AI 模型 / 质量算法吃的最大长边。
@@ -576,7 +579,7 @@ def scan_folder(folder: str) -> list[tuple[str, list[str]]]:
             continue
         for n in names:
             suffix = Path(n).suffix.lower()
-            if suffix not in ALL_INPUT_EXTS:
+            if suffix not in ALL_INPUT_EXTS and suffix not in SIDECAR_EXTS:
                 continue
             full = str(Path(root) / n)
             key = (root, Path(n).stem.lower())
@@ -587,13 +590,16 @@ def scan_folder(folder: str) -> list[tuple[str, list[str]]]:
         files.sort()  # 稳定顺序
         raws = [f for f in files if Path(f).suffix.lower() in RAW_EXTS]
         non_raws = [f for f in files if Path(f).suffix.lower() in IMAGE_EXTS]
+        sidecars = [f for f in files if Path(f).suffix.lower() in SIDECAR_EXTS]
         if raws:
             primary = raws[0]
-            companions = raws[1:] + non_raws
-        else:
-            # 不可能两个都空（groups 至少有一个元素）
+            companions = raws[1:] + non_raws + sidecars
+        elif non_raws:
             primary = non_raws[0]
-            companions = non_raws[1:]
+            companions = non_raws[1:] + sidecars
+        else:
+            # 只有 sidecar、没有任何图片/RAW：孤儿 xmp，不单独搬运。
+            continue
         result.append((primary, companions))
     result.sort(key=lambda t: t[0])
     return result
