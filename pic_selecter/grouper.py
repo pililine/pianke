@@ -570,20 +570,36 @@ def scan_folder(folder: str) -> list[tuple[str, list[str]]]:
     用 companion JPG 或 RAW 内嵌预览来加载）。搬运时 primary 和所有 companions
     一起搬到相同目标目录、共享 stem。
     """
+    import logging
+    log = logging.getLogger("pic_selecter")
     p = Path(folder)
     # 按 (parent_dir, stem.lower()) 聚合候选文件
     groups: dict[tuple[str, str], list[str]] = {}
-    for root, _, names in os.walk(p):
+    ignored_system = 0  # macOS AppleDouble(._*) 等"像图片但不是照片"的系统文件
+    for root, dirs, names in os.walk(p):
         rel = Path(root).relative_to(p)
         if rel.parts and rel.parts[0] in {"winners", "losers", "_pic_selecter"}:
             continue
+        # 跳过隐藏目录（移动硬盘常见的 .Trashes / .Spotlight-V100 / .fseventsd 等）
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
         for n in names:
             suffix = Path(n).suffix.lower()
+            # 跳过 macOS AppleDouble(._DSCxxxx.JPG)、.DS_Store 及其它隐藏文件：
+            # 它们不是照片本体，强行解码会触发 UnidentifiedImageError。
+            # 只把"扩展名看着像图片/sidecar"的隐藏文件计入 ignored_system，
+            # 这正是会被误当照片的那批；其它隐藏文件本就不在受支持扩展名内。
+            if n.startswith("."):
+                if suffix in ALL_INPUT_EXTS or suffix in SIDECAR_EXTS:
+                    ignored_system += 1
+                continue
             if suffix not in ALL_INPUT_EXTS and suffix not in SIDECAR_EXTS:
                 continue
             full = str(Path(root) / n)
             key = (root, Path(n).stem.lower())
             groups.setdefault(key, []).append(full)
+
+    if ignored_system:
+        log.info(f"ignored system files: {ignored_system}")
 
     result: list[tuple[str, list[str]]] = []
     for files in groups.values():
