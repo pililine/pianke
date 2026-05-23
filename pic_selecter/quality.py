@@ -36,6 +36,10 @@ class QualityInfo:
     flags: list[str]
     auto_reject: bool
     reject_reason: str | None = None
+    # 软提示（warning）：不自动拒、不进 losers，照常进入分组/PK，仅供人工判断。
+    # 例如美学评分偏低、轻微人脸焦点不足、综合分偏低但技术指标尚可。
+    warnings: list[str] = field(default_factory=list)
+    warning_reason: str | None = None
     # 人脸感知信号（InsightFace 不可用或没检测到时为 None / 0）
     face_count: int = 0
     face_sharpness: Optional[float] = None  # 最大脸的拉普拉斯方差
@@ -142,6 +146,32 @@ REASON_LABELS = {
     "low_aesthetic": "美学评分偏低",
     "llm_reject": "AI 初筛判定为废片",
     "score_too_low": "综合质量不达标",
+}
+
+
+# 硬废片：技术性硬伤，自动 reject（进 losers，可在初筛复核里放回）。
+HARD_REJECT_FLAGS = {
+    "very_blurry",        # 严重失焦
+    "face_very_blurry",   # 人脸严重失焦
+    "eyes_closed",        # 明显闭眼
+    "all_eyes_closed",    # 合影全员闭眼
+    "underexposed",       # 严重欠曝
+    "overexposed",        # 严重过曝
+    "low_information",    # 画面几乎空白（盖镜头/全黑）
+    "too_small",          # 非拍摄文件（截图等）
+    "tiny_file",          # 文件异常小
+    "llm_reject",         # 土豪模式 LLM 判废（expert 用不到，留作兼容）
+}
+
+# 软提示：只标记 warning，不自动拒、不进 losers，照常进入分组/PK。
+# 这些是"主观/相对"问题，交给用户人工判断，避免 expert 模式过度激进误杀。
+WARNING_FLAGS = {
+    "low_aesthetic",      # 美学评分偏低（默认不再自动拒）
+    "face_blurry",        # 轻微人脸焦点不足（区别于 face_very_blurry）
+    "blurry",             # 焦点偏软（非严重）
+    "low_contrast",       # 反差不足
+    "face_clipped",       # 人脸贴边
+    "score_too_low",      # 综合分偏低但无硬伤（"分数低但技术指标还可以"）
 }
 
 
@@ -306,12 +336,18 @@ def analyze_image(
         face_sharpness=face_sharp,
         score_adjust=profile["score_adjust"],
     )
+    # 只有"硬废片"才自动 reject。reject_reason 仅从硬旗推导，避免被软旗误标。
     auto_reject_flags = _rejecting_flags(flags)
-    score_floor = profile.get("score_floor", 30.0)
-    auto_reject = bool(auto_reject_flags) or quality_score < score_floor
-    reject_reason = _reason_for(flags) if auto_reject_flags else None
-    if auto_reject and reject_reason is None:
-        reject_reason = REASON_LABELS["score_too_low"]
+    auto_reject = bool(auto_reject_flags)
+    reject_reason = _reason_for(auto_reject_flags) if auto_reject_flags else None
+
+    # 软提示（warning）：不自动拒、不进 losers，仅供人工判断。
+    # 综合分低于 floor 但没有任何硬伤 → 也只当 warning（"分数低但技术指标还可以"）。
+    score_floor = profile.get("score_floor", 50.0)
+    warnings = _warning_flags(flags)
+    if (not auto_reject) and quality_score < score_floor and "score_too_low" not in warnings:
+        warnings.append("score_too_low")
+    warning_reason = _warning_reason(warnings) if warnings else None
 
     return QualityInfo(
         salient_sharpness=round(salient_sharp, 3) if salient_sharp is not None else None,
@@ -329,6 +365,8 @@ def analyze_image(
         flags=flags,
         auto_reject=auto_reject,
         reject_reason=reject_reason,
+        warnings=warnings,
+        warning_reason=warning_reason,
         face_count=face_count,
         face_sharpness=round(face_sharp, 3) if face_sharp is not None else None,
         eyes_open_score=round(eyes_score, 4) if eyes_score is not None else None,
@@ -475,23 +513,26 @@ def _quality_score(
 
 
 def _rejecting_flags(flags: list[str]) -> list[str]:
-    hard = {
-        "very_blurry",
-        "underexposed",
-        "overexposed",
-        "low_information",
-        "too_small",
-        "tiny_file",
-        "face_very_blurry",
-        "face_blurry",
-        "eyes_closed",
-        "all_eyes_closed",
-        "llm_reject",
-        # 美学三模型 2-of-3 低 → 真的拒；之前不在 hard 里，导致 expert
-        # 模式独有的美学信号完全不参与拒片决策
-        "low_aesthetic",
-    }
-    return [f for f in flags if f in hard]
+    """只返回会触发自动拒片的"硬废片"旗。
+
+    low_aesthetic（美学偏低）与 face_blurry（轻微人脸焦点不足）已降级为软提示，
+    不再自动拒——避免 expert 模式过度激进误杀，交给用户在擂台里人工判断。
+    """
+    return [f for f in flags if f in HARD_REJECT_FLAGS]
+
+
+def _warning_flags(flags: list[str]) -> list[str]:
+    """返回软提示旗（不自动拒，仅 warning）。"""
+    return [f for f in flags if f in WARNING_FLAGS]
+
+
+def _warning_reason(warnings: list[str]) -> str | None:
+    """软提示的展示文案，按优先级取一个。"""
+    for flag in ("low_aesthetic", "face_blurry", "blurry",
+                 "low_contrast", "face_clipped", "score_too_low"):
+        if flag in warnings:
+            return REASON_LABELS.get(flag)
+    return None
 
 
 def _reason_for(flags: list[str]) -> str | None:

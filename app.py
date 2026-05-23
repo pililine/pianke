@@ -696,10 +696,13 @@ def _meta_entry(info: ImageInfo) -> dict:
               "face_count", "face_sharpness", "eyes_open_score",
               "salient_sharpness", "aesthetic_score",
               "musiq_score", "clipiqa_score",
-              "llm_verdict", "llm_reason"):
+              "llm_verdict", "llm_reason", "warning_reason"):
         v = q.get(k)
         if v is not None:
             out[k] = v
+    # 软提示旗（可能为空 list，单独处理：非 None 即带上）
+    if q.get("warnings"):
+        out["warnings"] = list(q.get("warnings") or [])
     # 也直接从 info 上读（compute_infos 写到了 quality dict 里，但兜底）
     aes = getattr(info, "aesthetic_score", None)
     if aes is not None and "aesthetic_score" not in out:
@@ -723,6 +726,25 @@ def _prescreen_rejections(infos: list[ImageInfo]) -> tuple[list[str], dict[str, 
             rejected.append(info.path)
             reasons[info.path] = reason
     return rejected, reasons
+
+
+def _warning_reason_of(info: ImageInfo) -> Optional[str]:
+    """软提示理由：不自动拒、不进 losers，仅供人工判断。已被硬拒的不再算 warning。"""
+    q = info.quality or {}
+    if q.get("auto_reject"):
+        return None
+    return q.get("warning_reason")
+
+
+def _prescreen_warnings(infos: list[ImageInfo]) -> tuple[list[str], dict[str, str]]:
+    warned: list[str] = []
+    reasons: dict[str, str] = {}
+    for info in infos:
+        wr = _warning_reason_of(info)
+        if wr:
+            warned.append(info.path)
+            reasons[info.path] = wr
+    return warned, reasons
 
 
 def _infos_from_memory_or_cache(folder: str) -> list[ImageInfo]:
@@ -2092,14 +2114,19 @@ def _run_job(folder: str, dry_run: bool, mode: str, wipe_cache: bool,
 
         if prescreen_enabled:
             rejected, reasons = _prescreen_rejections(infos)
-            # 落总结到 log.txt：每个 reject 一行，便于复盘
+            warned, warn_reasons = _prescreen_warnings(infos)
+            # 落总结到 log.txt：区分硬废片(auto_reject)与软提示(warning)，便于复盘
             from collections import Counter
             reason_counts = Counter(reasons.values())
+            warn_counts = Counter(warn_reasons.values())
             logger.info(
-                f"[{engine}] 初筛汇总：共 {len(infos)} 张，自动 reject {len(rejected)} 张"
+                f"[{engine}] 初筛汇总：共 {len(infos)} 张，"
+                f"auto_reject_count={len(rejected)}，warning_count={len(warned)}"
             )
             for r, n in reason_counts.most_common():
-                logger.info(f"[{engine}]   · {r}: {n} 张")
+                logger.info(f"[{engine}]   reject  · {r}: {n} 张")
+            for r, n in warn_counts.most_common():
+                logger.info(f"[{engine}]   warning · {r}: {n} 张（不自动拒，进擂台人工判断）")
             sess = build_prescreen_session_from_infos(
                 folder, dry_run, mode, infos,
                 threshold_near, threshold_far, near_seconds,
